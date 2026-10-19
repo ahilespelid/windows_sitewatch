@@ -119,8 +119,8 @@ public static class SiteChecker
             SocketException se when se.SocketErrorCode == SocketError.TimedOut => "нет ответа (таймаут соединения)",
             SocketException se => $"сеть: {se.SocketErrorCode}",
             System.Security.Authentication.AuthenticationException => "ошибка SSL-сертификата",
-            FormatException fe => fe.Message,
             UriFormatException => "неверный адрес",
+            FormatException fe => fe.Message,
             _ => inner.Message,
         };
     }
