@@ -262,6 +262,7 @@ public sealed class MainForm : Form
                     : st switch
                     {
                         { IsDown: true } => ("НЕ РАБОТАЕТ", Color.FromArgb(255, 215, 215)),
+                        { Muted: true } => ("адрес не найден", Color.FromArgb(235, 235, 235)),
                         { LastOk: false } => ($"сбой {st.ConsecutiveFails}/{_cfg.FailThreshold}", Color.FromArgb(255, 240, 200)),
                         { LastOk: true } => ("работает", Color.FromArgb(225, 245, 230)),
                         _ => ("ждём проверку", Color.White),

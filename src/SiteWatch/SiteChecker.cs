@@ -11,6 +11,8 @@ public sealed class CheckResult
     /// <summary>Коротко, что увидели: «200 OK», «таймаут», «нет слова на странице»…</summary>
     public string Details { get; init; } = "";
     public long ElapsedMs { get; init; }
+    /// <summary>Домен не найден (DNS): опечатка в адресе или домена не существует.</summary>
+    public bool HostNotFound { get; init; }
 }
 
 /// <summary>Одна проверка одного адреса. Не бросает исключений.</summary>
@@ -57,7 +59,13 @@ public static class SiteChecker
         }
         catch (Exception ex)
         {
-            return new CheckResult { Ok = false, Details = Describe(ex), ElapsedMs = sw.ElapsedMilliseconds };
+            return new CheckResult
+            {
+                Ok = false,
+                Details = Describe(ex),
+                ElapsedMs = sw.ElapsedMilliseconds,
+                HostNotFound = IsHostNotFound(ex),
+            };
         }
     }
 
@@ -68,6 +76,9 @@ public static class SiteChecker
         var code = (int)response.StatusCode;
         var status = $"{code} {response.ReasonPhrase}".Trim();
 
+        // 401/403 — сайт жив, просто просит войти (админки, WebDAV).
+        if (code == 401 || code == 403)
+            return (true, $"{status} (нужен вход — сайт отвечает)");
         if (code < 200 || code >= 400)
             return (false, $"ответ {status}");
 
@@ -104,6 +115,16 @@ public static class SiteChecker
         if (idx <= 0 || idx == a.Length - 1 || !int.TryParse(a[(idx + 1)..], out var port) || port < 1 || port > 65535)
             throw new FormatException("адрес порта пишется так: host:port");
         return (a[..idx].Trim('[', ']'), port);
+    }
+
+    private static bool IsHostNotFound(Exception ex)
+    {
+        for (var e = ex; e != null; e = e.InnerException)
+        {
+            if (e is SocketException se && (se.SocketErrorCode == SocketError.HostNotFound || se.SocketErrorCode == SocketError.NoData))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>Понятное описание ошибки вместо стека .NET.</summary>

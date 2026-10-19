@@ -16,6 +16,13 @@ public sealed class SiteStatus
     public bool IsDown { get; set; }
     public DateTime? DownSince { get; set; }
     public DateTime? LastAlertAt { get; set; }
+    /// <summary>Хоть раз открылся с момента добавления (или запуска программы).</summary>
+    public bool EverOk { get; set; }
+    /// <summary>
+    /// Адрес не найден, и сайт ни разу не открывался — похоже на опечатку или
+    /// несуществующий домен. Ошибку показываем, тревогу не поднимаем.
+    /// </summary>
+    public bool Muted { get; set; }
 
     public SiteStatus Copy() => (SiteStatus)MemberwiseClone();
 }
@@ -121,7 +128,7 @@ public sealed class MonitorService : IDisposable
         var list = Snapshot();
         if (list.Count == 0 || list.All(s => s.LastOk == null)) return OverallState.Unknown;
         if (list.Any(s => s.IsDown)) return OverallState.Down;
-        if (list.Any(s => s.LastOk == false)) return OverallState.Warning;
+        if (list.Any(s => s.LastOk == false && !s.Muted)) return OverallState.Warning;
         return OverallState.AllOk;
     }
 
@@ -279,6 +286,8 @@ public sealed class MonitorService : IDisposable
 
                 if (res.Ok)
                 {
+                    st.EverOk = true;
+                    st.Muted = false;
                     if (st.IsDown)
                     {
                         recovered.Add((st, now - (st.DownSince ?? now)));
@@ -290,6 +299,19 @@ public sealed class MonitorService : IDisposable
                     st.LastAlertAt = null;
                     continue;
                 }
+
+                // Адрес не найден, а сайт ни разу не открывался — это опечатка или
+                // несуществующий домен, а не падение. Показываем ошибку, не тревожим.
+                // Если домен работал и пропал (например, истёк) — это уже тревога.
+                if (res.HostNotFound && !st.EverOk)
+                {
+                    st.Muted = true;
+                    st.ConsecutiveFails = 0;
+                    st.IsDown = false;
+                    st.DownSince = null;
+                    continue;
+                }
+                st.Muted = false;
 
                 st.ConsecutiveFails++;
                 if (st.ConsecutiveFails == 1)
