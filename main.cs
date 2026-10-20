@@ -1,12 +1,12 @@
-// SiteWatch — паук-звонарь: следит за нашими сайтами, при падении пишет на почту
-// (и, когда подключим модем, звонит). Один файл, C# 5 / .NET Framework 4.x —
+// SiteWatch — паук-звонарь: следит за нашими сайтами, при падении пишет на почту,
+// а через GSM-модем шлёт SMS и звонит. Один файл, C# 5 / .NET Framework 4.x —
 // собирается встроенным в Windows компилятором, см. build.cmd.
 //
 // Как это устроено, в двух словах:
 //   • Program.Main — точка входа: не даёт запустить вторую копию и поднимает значок в трее.
 //   • TrayApp — значок в области уведомлений; связывает «сторожа» (Watcher) и окно (MainForm).
 //   • Watcher — фоновый поток: раз в IntervalSeconds обходит все сайты (Checker)
-//     и решает, когда тревожить (Alerts: письмо и, если есть модем, звонок).
+//     и решает, когда тревожить (Alerts: письмо, а через модем — SMS и звонок).
 //   • MainForm — окно с двумя вкладками: «Состояние» и «Настройки».
 //   • Config — настройки в %AppData%\SiteWatch\config.txt; Log — журнал там же.
 //   • Native — обращения к Windows API и реестру; Icons — значки.
@@ -60,7 +60,7 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("SiteWatch")]
 // Версия сборки. Раз AssemblyFileVersion не задан, она же попадает в «Версию файла».
 // Держать в согласии с Program.Version.
-[assembly: AssemblyVersion("0.4.2.0")]
+[assembly: AssemblyVersion("0.5.0.0")]
 
 // Всё приложение — в одном пространстве имён. Все классы internal: снаружи exe они никому не нужны.
 namespace SiteWatch
@@ -71,7 +71,7 @@ namespace SiteWatch
     internal static class Program
     {
         // Версия: заголовок окна, журнал, заголовок User-Agent в запросах к сайтам.
-        public const string Version = "0.4.2";
+        public const string Version = "0.5.0";
         // Ключ командной строки «запуститься свёрнутым в трей». Его дописывает автозапуск (Native.Autostart).
         public const string TrayArg = "--tray";
 
@@ -609,6 +609,9 @@ namespace SiteWatch
         public bool InternetOk = true;
         // Время окончания последнего круга — для плашки «проверено в …».
         public DateTime? LastRound;
+        // Сколько кругов подряд у этого компьютера нет интернета и ушло ли об этом SMS через модем.
+        private int _offlineRounds;
+        private bool _offlineSmsSent;
 
         // Событие «данные изменились».
         public event Action Changed;
@@ -708,13 +711,25 @@ namespace SiteWatch
                 {
                     // Сообщаем только при переходе «был интернет → пропал», а не каждый круг.
                     if (InternetOk) { InternetOk = false; Log.Write("Нет интернета у этого компьютера"); Say("Нет интернета у этого компьютера — сайты проверить нельзя", true); }
-                    // Отмечаем время круга, обновляем окно (фиолетовое состояние) и выходим. Результаты сайтов отбрасываются.
+                    // Отмечаем время круга, обновляем окно (фиолетовое состояние). Результаты сайтов отбрасываются.
                     LastRound = DateTime.Now; Raise();
+                    // Интернета нет FailThreshold кругов подряд — сайты никто не проверяет, а письмо не отправить.
+                    // Модем ходит через сотовую сеть, интернет компьютера ему не нужен — одно SMS об этом.
+                    _offlineRounds++;
+                    if (_offlineRounds == Program.FailThreshold)
+                        _offlineSmsSent = await Modem(cfg, "SiteWatch (" + Environment.MachineName + "): у компьютера нет интернета, сайты не проверяются. " + DateTime.Now.ToString("HH:mm"), false);
                     return;
                 }
             }
             // Интернет вернулся после перерыва — одно уведомление. Дальше — обычная обработка.
             if (!InternetOk) { InternetOk = true; Log.Write("Интернет снова есть"); Say("Интернет снова есть", false); }
+            // Если о пропаже интернета уходило SMS — сообщаем, что проверка снова идёт.
+            _offlineRounds = 0;
+            if (_offlineSmsSent)
+            {
+                _offlineSmsSent = false;
+                await Modem(cfg, "SiteWatch (" + Environment.MachineName + "): интернет снова есть, сайты проверяются. " + DateTime.Now.ToString("HH:mm"), false);
+            }
 
             // Единое время на весь круг — одинаковое в таблице, журнале и письмах.
             var now = DateTime.Now;
@@ -774,18 +789,26 @@ namespace SiteWatch
             {
                 // Всплывающее уведомление в трее.
                 Say("Не работает: " + Names(down), true);
-                // Письмо (и звонок — urgent = true): одно на все сайты, упавшие в этом круге.
-                await Alert(cfg, "НЕ РАБОТАЕТ: " + Names(down), Body("Перестали отвечать:", down, now), true);
+                // Письмо, SMS с причиной и звонок: одно оповещение на все сайты, упавшие в этом круге.
+                await Alert(cfg, "НЕ РАБОТАЕТ: " + Names(down), Body("Перестали отвечать:", down, now), SmsText("НЕ РАБОТАЕТ", down, now, true), true);
             }
-            // Напоминание — тоже со звонком; всплывающее уведомление не показываем, чтобы не надоедать.
+            // Напоминание — письмо и звонок (причина уже была в первом SMS, лишние SMS не шлём);
+            // всплывающее уведомление не показываем, чтобы не надоедать.
             if (still.Count > 0)
-                await Alert(cfg, "ВСЁ ЕЩЁ НЕ РАБОТАЕТ: " + Names(still), Body("По-прежнему не отвечают:", still, now), true);
-            // Восстановление: уведомление и письмо, без звонка (urgent = false).
+                await Alert(cfg, "ВСЁ ЕЩЁ НЕ РАБОТАЕТ: " + Names(still), Body("По-прежнему не отвечают:", still, now), null, true);
+            // Восстановление: уведомление, письмо и SMS, без звонка.
             if (up.Count > 0)
             {
                 Say("Снова работает: " + Names(up), false);
-                await Alert(cfg, "Снова работает: " + Names(up), Body("Снова работают:", up, now), false);
+                await Alert(cfg, "Снова работает: " + Names(up), Body("Снова работают:", up, now), SmsText("Снова работает", up, now, false), false);
             }
+        }
+
+        // Короткий текст SMS: «НЕ РАБОТАЕТ: litewms.ru (502 Bad Gateway), lite-box.ru (нет ответа за 15 с). 14:05».
+        // Причины — только для упавших. Длинный текст модем отправит частями, телефон склеит их в одно сообщение.
+        private static string SmsText(string title, List<SiteState> list, DateTime now, bool reasons)
+        {
+            return title + ": " + string.Join(", ", list.Select(s => reasons ? s.Name + " (" + s.Details + ")" : s.Name)) + ". " + now.ToString("HH:mm");
         }
 
         // Домены через запятую — для темы письма и уведомлений.
@@ -824,32 +847,56 @@ namespace SiteWatch
             return (int)t.TotalDays + " д " + t.Hours + " ч";
         }
 
-        // Отправить оповещение: сначала письмо, потом (для срочных) звонки. Сбой одного не отменяет другое.
-        private async Task Alert(Config cfg, string subject, string body, bool urgent)
+        // Отправить оповещение: письмо и модем (SMS, звонок) — одновременно. Если почта «висит» без связи
+        // с сервером, SMS и звонок не ждут её. sms = null — без SMS; call — звонить ли. Сбой одного не отменяет другое.
+        private async Task Alert(Config cfg, string subject, string body, string sms, bool call)
         {
-            // Письмо. Ушло — пометка в журнале.
-            try { await Alerts.MailAsync(cfg, subject, body); Log.Write("Письмо: " + subject); }
-            // Не ушло (нет пароля, сервер не принял, нет связи) — в журнал и всплывающим уведомлением,
-            // чтобы человек у компьютера узнал, что тревога не дошла.
-            catch (Exception ex) { Log.Write("ERROR письмо не ушло: " + ex.Message); Say("Письмо не отправлено: " + ex.Message, true); }
+            await Task.WhenAll(Mail(cfg, subject, body), Modem(cfg, sms, call));
+        }
 
-            // Звоним, только если это тревога (а не «снова работает»), есть номера и указан COM-порт.
-            if (urgent && cfg.Phones.Count > 0 && !string.IsNullOrEmpty(cfg.ComPort))
+        // Письмо. Не ушло (нет пароля, сервер не принял, нет связи) — в журнал целиком и всплывающим уведомлением,
+        // чтобы человек у компьютера узнал, что тревога не дошла.
+        private async Task Mail(Config cfg, string subject, string body)
+        {
+            try { await Alerts.MailAsync(cfg, subject, body); Log.Write("Письмо: " + subject); }
+            catch (Exception ex)
             {
-                // Звонок — блокирующая операция (ожидание по 30 с на номер), поэтому выносим его в пул потоков через Task.Run.
-                try { await Task.Run(() => Alerts.Call(cfg, cfg.Phones)); }
-                // Модем не ответил, порт занят и т. п. — в журнал и всплывающим уведомлением.
+                Log.Write("ERROR письмо не ушло (" + cfg.SmtpHost + ":" + cfg.SmtpPort + "): " + ex);
+                Say("Письмо не отправлено: " + Alerts.Explain(ex), true);
+            }
+        }
+
+        // SMS и/или звонок на все номера через модем — если указаны номера и COM-порт. Вернёт true, если SMS ушло.
+        // Модем работает медленно (SMS — секунды, звонок — до 30 с на номер), поэтому всё — в пуле потоков через Task.Run.
+        private async Task<bool> Modem(Config cfg, string sms, bool call)
+        {
+            if (cfg.Phones.Count == 0 || string.IsNullOrEmpty(cfg.ComPort)) return false;
+            var sent = false;
+            if (sms != null)
+            {
+                try { await Task.Run(() => Alerts.Sms(cfg.ComPort, cfg.Phones, sms)); sent = true; }
+                catch (Exception ex) { Log.Write("ERROR SMS не ушло: " + ex.Message); Say("SMS не отправлено: " + ex.Message, true); }
+            }
+            if (call)
+            {
+                try { await Task.Run(() => Alerts.Call(cfg.ComPort, cfg.Phones)); }
                 catch (Exception ex) { Log.Write("ERROR звонок не прошёл: " + ex.Message); Say("Звонок не прошёл: " + ex.Message, true); }
             }
+            return sent;
         }
     }
 
     // ===================================================================== оповещения
 
-    // Способы оповещения: письмо через SMTP и звонок через GSM-модем.
+    // Способы оповещения: письмо через SMTP, SMS и звонок через GSM-модем.
     internal static class Alerts
     {
-        /// <summary>Письмо через SMTP с STARTTLS (порт 587; 465 SmtpClient не умеет).</summary>
+        /// <summary>
+        /// Письмо через SMTP. Основной путь — системный curl.exe (есть в Windows 10 1803+ и 11): встроенный в .NET
+        /// SmtpClient на части компьютеров обрывает TLS-соединение с Gmail («Сервер нарушил протокол»), а curl
+        /// работает через ту же системную защиту соединений Windows (Schannel) без этой ошибки. Нет curl.exe —
+        /// отправляем через SmtpClient. Порт 587 — STARTTLS, 465 — сразу TLS (его умеет только curl).
+        /// </summary>
         // Бросает исключение при любой проблеме — его ловит вызывающий (Watcher.Alert или кнопка «Тестовое письмо»).
         public static async Task MailAsync(Config cfg, string subject, string body)
         {
@@ -857,6 +904,14 @@ namespace SiteWatch
             if (cfg.MailTo.Count == 0) throw new InvalidOperationException("не указано, кому писать");
             if (string.IsNullOrEmpty(cfg.SmtpUser) || string.IsNullOrEmpty(cfg.SmtpPassword))
                 throw new InvalidOperationException("не указан логин или пароль почты");
+            var curl = CurlPath();
+            if (curl != null)
+            {
+                // curl — отдельная программа; ждём её в пуле потоков, чтобы не держать вызывающий поток.
+                await Task.Run(() => MailCurl(curl, cfg, subject, body));
+                return;
+            }
+            // Запасной путь — встроенный SmtpClient (только STARTTLS, порт 587).
             // MailMessage и SmtpClient — освобождаемые ресурсы; using закроет их после отправки.
             using (var msg = new MailMessage())
             using (var smtp = new SmtpClient(cfg.SmtpHost, cfg.SmtpPort))
@@ -881,40 +936,366 @@ namespace SiteWatch
             }
         }
 
-        /// <summary>
-        /// ЗАГОТОВКА. Звонок через GSM-модем (AT-команды по COM-порту): ATD номер; — вызов,
-        /// через 30 с ATH — сброс. Трубку брать не нужно, звонок и есть сигнал.
-        /// На живом модеме не проверялось; модем нужен с поддержкой голосовых вызовов.
-        /// </summary>
-        // Блокирующий метод (около 32 с на каждый номер) — вызывать вне потока интерфейса (через Task.Run).
-        public static void Call(Config cfg, List<string> phones)
+        // Путь к curl.exe из Windows или null, если его нет (Windows старше 10 1803).
+        private static string CurlPath()
         {
-            // Замок на весь звонок: если одновременно сработает тревога и «Тестовый звонок», они встанут в очередь,
-            // а не полезут в порт вдвоём.
-            lock (typeof(Alerts)) // модем один — по очереди
-            // COM-порт: 115200 бод; ответы модема заканчиваются \r; таймауты чтения и записи по 3 с;
-            // DTR и RTS включены — многие модемы без них молчат.
-            using (var port = new SerialPort(cfg.ComPort, 115200) { NewLine = "\r", ReadTimeout = 3000, WriteTimeout = 3000, DtrEnable = true, RtsEnable = true })
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "curl.exe");
+            return File.Exists(path) ? path : null;
+        }
+
+        // Отправка через curl.exe: письмо целиком пишется во временный файл, curl передаёт его серверу.
+        // Логин и пароль идут curl через стандартный ввод (--config -), а не в командной строке —
+        // так их не видно в списке процессов. Блокирующий метод — вызывать через Task.Run.
+        private static void MailCurl(string curl, Config cfg, string subject, string body)
+        {
+            var file = Path.GetTempFileName();
+            try
             {
-                // Порт занят другой программой или его нет — здесь вылетит исключение, его поймает вызывающий.
-                port.Open();
-                // «Ты здесь?» — модем обязан ответить OK, иначе дальше смысла нет (mustOk = true → исключение).
-                At(port, "AT", true);
-                // Выключить эхо, чтобы модем не повторял наши команды в ответе. Ответ не обязателен.
-                At(port, "ATE0", false);
-                // Обзваниваем номера по очереди.
-                foreach (var phone in phones)
+                File.WriteAllBytes(file, Encoding.UTF8.GetBytes(BuildMessage(cfg.SmtpUser, cfg.MailTo, subject, body)));
+
+                // 465 — защищённое соединение сразу (smtps://), иначе — обычное с переходом в TLS (STARTTLS, --ssl-reqd).
+                var args = new List<string>
                 {
-                    // В журнал — кому звоним.
-                    Log.Write("Звоню " + phone);
-                    // ATD<номер>; — голосовой вызов (точка с запятой = голос, без неё модем начал бы звонок для данных).
-                    // Потом ждём 30 с: всё это время телефон звонит — это и есть сигнал.
-                    try { At(port, "ATD" + phone + ";", true); Thread.Sleep(30000); }
-                    // В любом случае кладём трубку (ATH) и даём модему 2 с передышки перед следующим номером.
-                    // Если ATD вернул ошибку, после сброса исключение выйдет наружу — оставшиеся номера не обзвонятся.
-                    finally { try { At(port, "ATH", false); } catch { } Thread.Sleep(2000); }
+                    "--silent", "--show-error", "--ssl-reqd", "--max-time", "60",
+                    "--url", (cfg.SmtpPort == 465 ? "smtps://" : "smtp://") + cfg.SmtpHost + ":" + cfg.SmtpPort,
+                    "--mail-from", cfg.SmtpUser,
+                };
+                foreach (var to in cfg.MailTo) { args.Add("--mail-rcpt"); args.Add(to); }
+                args.AddRange(new[] { "--upload-file", file, "--config", "-" });
+
+                var psi = new ProcessStartInfo(curl, string.Join(" ", args.Select(a => "\"" + a.Replace("\"", "\\\"") + "\"")))
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                using (var p = Process.Start(psi))
+                {
+                    // Вывод читаем параллельно, чтобы curl не застрял на заполненном буфере.
+                    var err = p.StandardError.ReadToEndAsync();
+                    var output = p.StandardOutput.ReadToEndAsync();
+                    // Строка конфигурации curl: user = "логин:пароль" (кавычки и обратные косые черты экранируются).
+                    var credentials = (cfg.SmtpUser + ":" + cfg.SmtpPassword).Replace("\\", "\\\\").Replace("\"", "\\\"");
+                    p.StandardInput.Write("user = \"" + credentials + "\"\n");
+                    p.StandardInput.Close();
+                    if (!p.WaitForExit(90000))
+                    {
+                        try { p.Kill(); } catch { }
+                        throw new InvalidOperationException("сервер почты не ответил за 90 с");
+                    }
+                    output.Wait(5000);
+                    err.Wait(5000);
+                    if (p.ExitCode != 0) throw new InvalidOperationException(CurlError(p.ExitCode, err.IsCompleted ? err.Result.Trim() : ""));
                 }
             }
+            finally
+            {
+                try { File.Delete(file); } catch { }
+            }
+        }
+
+        // Коды завершения curl — по-человечески; в скобках — текст самого curl.
+        private static string CurlError(int code, string raw)
+        {
+            string text;
+            switch (code)
+            {
+                case 67: text = "сервер не принял логин или пароль"; break;
+                case 6: text = "сервер почты не найден (DNS)"; break;
+                case 7: text = "не удалось подключиться к серверу почты"; break;
+                case 28: text = "сервер почты не ответил вовремя"; break;
+                case 35: case 60: text = "ошибка защищённого соединения с сервером почты"; break;
+                case 55: case 56: text = "соединение с сервером почты оборвалось"; break;
+                case 64: text = "сервер почты не поддерживает защищённое соединение"; break;
+                default: text = "curl завершился с кодом " + code; break;
+            }
+            return raw.Length == 0 ? text : text + " (" + raw + ")";
+        }
+
+        // Письмо в формате RFC 5322: заголовки с кириллицей — в UTF-8/base64 (=?UTF-8?B?…?=), текст — base64, строки через CRLF.
+        private static string BuildMessage(string from, List<string> to, string subject, string body)
+        {
+            // Дата вида «Tue, 20 Oct 2026 21:03:00 +0300».
+            var date = DateTimeOffset.Now.ToString("ddd, dd MMM yyyy HH:mm:ss zzz", System.Globalization.CultureInfo.InvariantCulture);
+            date = date.Remove(date.Length - 3, 1);
+            // Переводы строк в тексте — единообразно CRLF.
+            var text = body.Replace("\r\n", "\n").Replace("\n", "\r\n");
+            var sb = new StringBuilder();
+            sb.Append("From: ").Append(EncodeWord("SiteWatch")).Append(" <").Append(from).Append(">\r\n");
+            sb.Append("To: ").Append(string.Join(", ", to)).Append("\r\n");
+            sb.Append("Subject: ").Append(EncodeWord(subject)).Append("\r\n");
+            sb.Append("Date: ").Append(date).Append("\r\n");
+            sb.Append("Message-ID: <").Append(Guid.NewGuid().ToString("N")).Append("@sitewatch>\r\n");
+            sb.Append("MIME-Version: 1.0\r\n");
+            sb.Append("Content-Type: text/plain; charset=UTF-8\r\n");
+            sb.Append("Content-Transfer-Encoding: base64\r\n");
+            sb.Append("\r\n");
+            sb.Append(Convert.ToBase64String(Encoding.UTF8.GetBytes(text), Base64FormattingOptions.InsertLineBreaks)).Append("\r\n");
+            return sb.ToString();
+        }
+
+        // Заголовок кусками по ≤45 байт UTF-8 (=?UTF-8?B?…?=), не разрывая символы; куски — на отдельных строках.
+        private static string EncodeWord(string s)
+        {
+            var words = new List<string>();
+            var chunk = new StringBuilder();
+            for (var i = 0; i < s.Length; i++)
+            {
+                // Суррогатная пара (эмодзи) — один символ из двух char, её не разрываем.
+                var ch = char.IsHighSurrogate(s[i]) && i + 1 < s.Length ? s.Substring(i++, 2) : s[i].ToString();
+                if (chunk.Length > 0 && Encoding.UTF8.GetByteCount(chunk.ToString() + ch) > 45)
+                {
+                    words.Add(chunk.ToString());
+                    chunk.Clear();
+                }
+                chunk.Append(ch);
+            }
+            if (chunk.Length > 0) words.Add(chunk.ToString());
+            return string.Join("\r\n ", words.Select(w => "=?UTF-8?B?" + Convert.ToBase64String(Encoding.UTF8.GetBytes(w)) + "?="));
+        }
+
+        // Понятный текст ошибки письма: вся цепочка причин, у SMTP — ещё и код ответа сервера.
+        // Например: «Сбой при отправке письма → Не удалось подключиться к удалённому серверу».
+        public static string Explain(Exception ex)
+        {
+            var parts = new List<string>();
+            for (var e = ex; e != null; e = e.InnerException)
+            {
+                var msg = e.Message.Trim();
+                var smtp = e as SmtpException;
+                if (smtp != null && smtp.StatusCode != SmtpStatusCode.GeneralFailure) msg += " [" + smtp.StatusCode + "]";
+                if (msg.Length > 0 && !parts.Contains(msg)) parts.Add(msg);
+            }
+            return string.Join(" → ", parts);
+        }
+
+        // ----------------------------------------------------------------- GSM-модем
+
+        // Модем один на всю программу — тревоги и тестовые кнопки работают с ним строго по очереди.
+        private static readonly object ModemLock = new object();
+        // Номер «склейки» для SMS из нескольких частей — случайный, чтобы телефон не перепутал разные сообщения.
+        private static readonly Random Rnd = new Random();
+
+        /// <summary>
+        /// SMS на все номера через GSM-модем (AT-команды по COM-порту, PDU-режим, кодировка UCS-2 — кириллица).
+        /// Длинный текст уходит частями, телефон показывает его одним сообщением. Блокирующий метод — вызывать через Task.Run.
+        /// Ошибка на одном номере не мешает остальным; в конце — исключение со списком номеров, куда не ушло.
+        /// </summary>
+        public static void Sms(string comPort, List<string> phones, string text)
+        {
+            lock (ModemLock)
+            using (var port = OpenPort(comPort))
+            {
+                Prepare(port);
+                // Модем мог только что включиться и ещё ищет сеть — ждём регистрацию до 30 с.
+                if (!WaitNetwork(port, 30)) Log.Write("Модем: нет регистрации в сети, всё равно пробую отправить SMS");
+                // PDU-режим: так SMS уходит в UCS-2 и длинный текст можно отправить частями.
+                At(port, "AT+CMGF=0", true);
+                var errors = new List<string>();
+                foreach (var phone in phones)
+                {
+                    try
+                    {
+                        var parts = SmsPdu.Encode(phone, text, (byte)Rnd.Next(256));
+                        foreach (var pdu in parts) SendPdu(port, pdu);
+                        Log.Write("SMS → " + phone + (parts.Count > 1 ? " (" + parts.Count + " части)" : ""));
+                    }
+                    catch (Exception ex)
+                    {
+                        errors.Add(phone + ": " + ex.Message);
+                        Log.Write("ERROR SMS → " + phone + ": " + ex.Message);
+                    }
+                }
+                if (errors.Count > 0) throw new InvalidOperationException(string.Join("; ", errors));
+            }
+        }
+
+        // Одна часть SMS: AT+CMGS=<длина> → приглашение «>» → PDU и Ctrl+Z → «+CMGS: n» и OK.
+        private static void SendPdu(SerialPort port, string pdu)
+        {
+            // Длина — в байтах и без первого байта PDU (адрес SMS-центра «00» = взять из SIM-карты).
+            var length = pdu.Length / 2 - 1;
+            port.DiscardInBuffer();
+            port.Write("AT+CMGS=" + length + "\r");
+            try { WaitFor(port, ">", 10); }
+            catch
+            {
+                // Приглашения не дождались — Esc отменяет ввод, чтобы модем не ждал текст вечно.
+                try { port.Write("\x1B"); } catch { }
+                throw;
+            }
+            port.Write(pdu + "\x1A");
+            // Сеть может подтверждать SMS до минуты.
+            var answer = WaitFor(port, "OK", 60);
+            if (answer.IndexOf("+CMGS", StringComparison.Ordinal) < 0)
+                throw new InvalidOperationException("модем не подтвердил отправку (" + Clean(answer) + ")");
+        }
+
+        /// <summary>
+        /// Звонок на все номера через GSM-модем: ATD номер; — вызов, до 30 с ожидания, ATH — сброс.
+        /// Трубку брать не нужно, звонок и есть сигнал; сбросили или занято — модем сразу переходит к следующему номеру.
+        /// Блокирующий метод (до ~32 с на номер) — вызывать через Task.Run.
+        /// </summary>
+        public static void Call(string comPort, List<string> phones)
+        {
+            lock (ModemLock)
+            using (var port = OpenPort(comPort))
+            {
+                Prepare(port);
+                WaitNetwork(port, 30);
+                // OK на ATD — сразу, не дожидаясь, пока снимут трубку.
+                At(port, "AT+COLP=0", false);
+                var errors = new List<string>();
+                foreach (var raw in phones)
+                {
+                    var phone = SmsPdu.Clean(raw);
+                    Log.Write("Звоню " + phone);
+                    try
+                    {
+                        // ATD<номер>; — голосовой вызов (точка с запятой = голос, без неё был бы звонок для данных).
+                        At(port, "ATD" + phone + ";", true);
+                        var end = WaitCallEnd(port, 30);
+                        if (end.Length > 0) Log.Write("Звонок " + phone + ": " + end);
+                    }
+                    catch (Exception ex) { errors.Add(phone + ": " + ex.Message); }
+                    // В любом случае кладём трубку и даём модему 2 с передышки перед следующим номером.
+                    finally { try { At(port, "ATH", false); } catch { } Thread.Sleep(2000); }
+                }
+                if (errors.Count > 0) throw new InvalidOperationException(string.Join("; ", errors));
+            }
+        }
+
+        // Ждать конца вызова до seconds секунд. Сбросили, занято, не дозвонились — вернуть это слово; иначе пустую строку.
+        private static string WaitCallEnd(SerialPort port, int seconds)
+        {
+            var until = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < until)
+            {
+                string line;
+                try { line = port.ReadLine().Trim(); }
+                catch (TimeoutException) { continue; }
+                if (line == "NO CARRIER" || line == "BUSY" || line == "NO ANSWER" || line == "NO DIALTONE") return line;
+            }
+            return "";
+        }
+
+        /// <summary>
+        /// «Найти модем»: опросить COM-порты. Для каждого — пара { порт, что на нём }; модем — где ответили на AT,
+        /// строка тогда начинается со слова «модем». Порт, который долго не открывается (бывает у Bluetooth), — не дольше 8 с.
+        /// </summary>
+        public static List<string[]> Probe(string[] ports)
+        {
+            var result = new List<string[]>();
+            foreach (var name in ports)
+            {
+                var p = name;
+                var task = Task.Run(() => ProbeOne(p));
+                result.Add(new[] { p, task.Wait(TimeSpan.FromSeconds(8)) ? task.Result : "не отвечает" });
+            }
+            return result;
+        }
+
+        // Один порт: AT → модель (AT+CGMM), SIM-карта (AT+CPIN?), регистрация в сети. Без замка ModemLock:
+        // если модем сейчас звонит, порт просто окажется занят. Исключения не выпускает.
+        private static string ProbeOne(string name)
+        {
+            try
+            {
+                using (var port = OpenPort(name))
+                {
+                    port.ReadTimeout = 1000;
+                    try { At(port, "AT", true); }
+                    catch (Exception)
+                    {
+                        Thread.Sleep(300);
+                        try { At(port, "AT", true); } catch (Exception) { return "не модем (нет ответа на AT)"; }
+                    }
+                    At(port, "ATE0", false);
+                    var model = At(port, "AT+CGMM", false);
+                    var pin = At(port, "AT+CPIN?", false);
+                    var sim = pin.IndexOf("READY", StringComparison.OrdinalIgnoreCase) >= 0 ? "SIM готова" : "SIM: " + (pin.Length > 0 ? pin : "нет ответа");
+                    return "модем " + (model.Length > 0 ? model : "(модель не назвал)") + ", " + sim + ", " + (Registered(port) ? "сеть есть" : "сети нет");
+                }
+            }
+            catch (UnauthorizedAccessException) { return "занят другой программой"; }
+            catch (Exception ex) { return "ошибка: " + ex.Message; }
+        }
+
+        // Открыть COM-порт модема: 115200 бод; ответы заканчиваются \r; таймауты чтения и записи по 3 с;
+        // DTR и RTS включены — многие модемы без них молчат. Не открылся — порт закрываем и выпускаем исключение.
+        private static SerialPort OpenPort(string name)
+        {
+            var port = new SerialPort(name, 115200) { NewLine = "\r", ReadTimeout = 3000, WriteTimeout = 3000, DtrEnable = true, RtsEnable = true, Encoding = Encoding.ASCII };
+            try { port.Open(); }
+            catch { port.Dispose(); throw; }
+            return port;
+        }
+
+        // Подготовка: модем на связи, эхо выключено, ошибки — словами (AT+CMEE=2), SIM-карта готова.
+        private static void Prepare(SerialPort port)
+        {
+            // Первый AT после открытия порта иногда теряется (модем подстраивает скорость) — даём вторую попытку.
+            try { At(port, "AT", true); }
+            catch (InvalidOperationException) { Thread.Sleep(500); At(port, "AT", true); }
+            At(port, "ATE0", false);
+            At(port, "AT+CMEE=2", false);
+            var pin = At(port, "AT+CPIN?", false);
+            if (pin.IndexOf("READY", StringComparison.OrdinalIgnoreCase) < 0)
+                throw new InvalidOperationException("SIM-карта не готова: " + (pin.Length > 0 ? pin : "нет ответа") + " — вставлена ли SIM, не стоит ли на ней PIN-код");
+        }
+
+        // Ждать регистрации в сети до seconds секунд (опрос раз в 2 с). true — зарегистрирован.
+        private static bool WaitNetwork(SerialPort port, int seconds)
+        {
+            var until = DateTime.UtcNow.AddSeconds(seconds);
+            while (true)
+            {
+                if (Registered(port)) return true;
+                if (DateTime.UtcNow >= until) return false;
+                Thread.Sleep(2000);
+            }
+        }
+
+        // Зарегистрирован ли модем в сети: «+CREG: 0,1» — домашняя сеть, «0,5» — роуминг.
+        // 4G-модемы могут сообщать регистрацию только в +CEREG — проверяем оба.
+        private static bool Registered(SerialPort port)
+        {
+            return Stat(At(port, "AT+CREG?", false), "+CREG:") || Stat(At(port, "AT+CEREG?", false), "+CEREG:");
+        }
+
+        private static bool Stat(string answer, string prefix)
+        {
+            var i = answer.IndexOf(prefix, StringComparison.Ordinal);
+            if (i < 0) return false;
+            var parts = answer.Substring(i + prefix.Length).Split(',');
+            if (parts.Length < 2) return false;
+            var stat = parts[1].Trim().Trim('"');
+            return stat == "1" || stat == "5";
+        }
+
+        // Ждать в ответе модема token (например, «>» или «OK») до seconds секунд. ERROR — исключение с текстом модема.
+        private static string WaitFor(SerialPort port, string token, int seconds)
+        {
+            var got = new StringBuilder();
+            var until = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < until)
+            {
+                var chunk = port.ReadExisting();
+                if (chunk.Length == 0) { Thread.Sleep(100); continue; }
+                got.Append(chunk);
+                var s = got.ToString();
+                if (s.Contains("ERROR")) throw new InvalidOperationException("модем: " + Clean(s));
+                if (s.Contains(token)) return s;
+            }
+            throw new InvalidOperationException("модем не ответил вовремя (" + Clean(got.ToString()) + ")");
+        }
+
+        // Ответ модема одной строкой: без пустых строк и переводов строки.
+        private static string Clean(string s)
+        {
+            return string.Join(" ", s.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).Where(x => x.Length > 0));
         }
 
         // Отправить AT-команду и собрать ответ до «OK». mustOk = true — без OK бросить исключение;
@@ -932,7 +1313,7 @@ namespace SiteWatch
             while (DateTime.UtcNow < until)
             {
                 string line;
-                // Читаем строку; если за 3 с ничего не пришло — прекращаем ждать.
+                // Читаем строку; если за время ReadTimeout ничего не пришло — прекращаем ждать.
                 try { line = port.ReadLine().Trim(); }
                 catch (TimeoutException) { break; }
                 // Пустые строки (модем любит \r\n) и эхо нашей же команды пропускаем.
@@ -941,14 +1322,94 @@ namespace SiteWatch
                 if (line == "OK") return answer.ToString().Trim();
                 // Любую другую строку запоминаем.
                 answer.Append(line).Append(' ');
-                // Явные отказы — ждать дальше нечего: ERROR, +CME ERROR (ошибка SIM-карты или сети),
+                // Явные отказы — ждать дальше нечего: ERROR, +CME ERROR (SIM-карта, сеть), +CMS ERROR (SMS),
                 // NO CARRIER (не соединилось), BUSY (занято).
-                if (line.StartsWith("ERROR") || line.StartsWith("+CME") || line == "NO CARRIER" || line == "BUSY") break;
+                if (line.StartsWith("ERROR") || line.StartsWith("+CME") || line.StartsWith("+CMS") || line == "NO CARRIER" || line == "BUSY") break;
             }
             // OK так и не пришёл: если он был обязателен — исключение с тем, что модем всё-таки ответил.
             if (mustOk) throw new InvalidOperationException("модем не ответил OK на " + cmd + " (" + answer.ToString().Trim() + ")");
             // Иначе возвращаем то, что есть.
             return answer.ToString().Trim();
+        }
+    }
+
+    // ===================================================================== SMS (PDU)
+
+    /// <summary>
+    /// Сборка SMS в формате PDU (3GPP TS 23.040, SMS-SUBMIT) — в UCS-2, чтобы шла кириллица.
+    /// Одна SMS — до 70 символов; длиннее — части по 67 с заголовком склейки (телефон соберёт их в одно сообщение).
+    /// </summary>
+    internal static class SmsPdu
+    {
+        // Больше 4 частей (268 символов) не шлём — остальное обрезается многоточием.
+        private const int MaxParts = 4;
+
+        // Номер без пробелов, скобок и дефисов; «+» в начале сохраняется: «+7 (989) 700-48-20» → «+79897004820».
+        public static string Clean(string phone)
+        {
+            var s = (phone ?? "").Trim();
+            return (s.StartsWith("+") ? "+" : "") + new string(s.Where(char.IsDigit).ToArray());
+        }
+
+        // Готовые PDU (шестнадцатеричные строки) — по одной на каждую часть SMS.
+        public static List<string> Encode(string phone, string text, byte reference)
+        {
+            var number = Clean(phone);
+            var digits = number.TrimStart('+');
+            if (digits.Length == 0) throw new InvalidOperationException("пустой номер телефона");
+
+            // Режем текст на части, не разрывая суррогатные пары (эмодзи и т. п.).
+            var chunks = new List<string>();
+            if (text.Length <= 70) chunks.Add(text);
+            else
+            {
+                var pos = 0;
+                while (pos < text.Length && chunks.Count < MaxParts)
+                {
+                    var len = Math.Min(67, text.Length - pos);
+                    if (len < text.Length - pos && char.IsHighSurrogate(text[pos + len - 1])) len--;
+                    chunks.Add(text.Substring(pos, len));
+                    pos += len;
+                }
+                if (pos < text.Length)
+                {
+                    var last = chunks[chunks.Count - 1];
+                    chunks[chunks.Count - 1] = last.Substring(0, last.Length - 1) + "…";
+                }
+            }
+
+            var result = new List<string>();
+            var multi = chunks.Count > 1;
+            for (var i = 0; i < chunks.Count; i++)
+            {
+                // Данные: [заголовок склейки 05 00 03 <номер склейки> <всего частей> <эта часть>] + текст в UCS-2.
+                var ud = new List<byte>();
+                if (multi) ud.AddRange(new byte[] { 0x05, 0x00, 0x03, reference, (byte)chunks.Count, (byte)(i + 1) });
+                ud.AddRange(Encoding.BigEndianUnicode.GetBytes(chunks[i]));
+
+                var sb = new StringBuilder();
+                sb.Append("00");                                // адрес SMS-центра не указываем — модем возьмёт его из SIM-карты
+                sb.Append(multi ? "41" : "01");                 // SMS-SUBMIT; +0x40 — в данных есть заголовок склейки
+                sb.Append("00");                                // номер сообщения назначит модем
+                sb.Append(digits.Length.ToString("X2"));        // длина номера получателя в цифрах
+                sb.Append(number.StartsWith("+") ? "91" : "81"); // 91 — международный формат (+7…), 81 — как набран (8…)
+                sb.Append(Swap(digits));                        // цифры парами наоборот, нечётная — с F на конце
+                sb.Append("00");                                // протокол — обычная SMS
+                sb.Append("08");                                // кодировка UCS-2
+                sb.Append(ud.Count.ToString("X2"));             // длина данных в байтах
+                foreach (var b in ud) sb.Append(b.ToString("X2"));
+                result.Add(sb.ToString());
+            }
+            return result;
+        }
+
+        // «79897004820» → «9798074028F0»: в PDU цифры номера идут парами, переставленными местами.
+        private static string Swap(string digits)
+        {
+            if (digits.Length % 2 == 1) digits += "F";
+            var sb = new StringBuilder();
+            for (var i = 0; i < digits.Length; i += 2) sb.Append(digits[i + 1]).Append(digits[i]);
+            return sb.ToString();
         }
     }
 
@@ -1290,13 +1751,17 @@ namespace SiteWatch
             // Пароль приложения Google — 16 букв, создаётся на myaccount.google.com/apppasswords
             // (нужна включённая двухэтапная аутентификация). Не обычный пароль от почты. Пробелы можно не убирать.
             Row(t, "Пароль приложения", _password);
-            // Телефоны в международном формате.
-            Row(t, "Кому звонить (+79…)", _phones);
-            // COM-порты, найденные в системе, — в выпадающий список. Только на момент создания окна:
-            // модем, подключённый позже, придётся вписать руками или перезапустить программу.
-            _port.Items.AddRange(SerialPort.GetPortNames());
-            // Строка выбора порта.
-            Row(t, "COM-порт модема", _port);
+            // Телефоны в международном формате: на них уходят SMS и звонки.
+            Row(t, "Телефоны: SMS и звонок (+79…)", _phones);
+            // COM-порты, найденные в системе, — в выпадающий список. Список обновляется при каждом раскрытии:
+            // модем можно подключить, не перезапуская программу.
+            RefreshPorts();
+            _port.DropDown += (s, e) => RefreshPorts();
+            // Строка выбора порта: список и кнопка «Найти модем» — опросит порты и выберет тот, где ответил модем.
+            var portRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
+            portRow.Controls.Add(_port);
+            portRow.Controls.Add(Btn("Найти модем", FindModem));
+            Row(t, "COM-порт модема", portRow);
             // Флажки — без подписи слева, текст у них свой.
             Row(t, "", _awake);
             Row(t, "", _autostart);
@@ -1307,7 +1772,8 @@ namespace SiteWatch
             bar.Controls.Add(Btn("Сохранить", Save));
             // Пробное письмо с тем, что введено сейчас (даже без сохранения).
             bar.Controls.Add(Btn("Тестовое письмо", TestMail));
-            // Пробный звонок на первый номер из списка.
+            // Пробные SMS и звонок — на первый номер из списка.
+            bar.Controls.Add(Btn("Тестовое SMS", TestSms));
             bar.Controls.Add(Btn("Тестовый звонок", TestCall));
             // Вернуть config.txt к значениям по умолчанию из кода (с подтверждением).
             bar.Controls.Add(Btn("Сбросить настройки", ResetConfig));
@@ -1321,7 +1787,9 @@ namespace SiteWatch
             {
                 AutoSize = true, ForeColor = SystemColors.GrayText, MaximumSize = new Size(560, 0),
                 Text = "Проверка раз в " + Program.IntervalSeconds + " с; упал = " + Program.FailThreshold + " неудачи подряд; " +
-                       "пока лежит — напоминание раз в " + Program.ReminderMinutes + " мин. Модем — заготовка, звонит, только если указан COM-порт и номера. " +
+                       "пока лежит — напоминание раз в " + Program.ReminderMinutes + " мин. " +
+                       "Модем (если указаны COM-порт и номера): сайт упал — SMS с причиной и звонок, напоминания — звонком, " +
+                       "сайт поднялся — SMS; у компьютера пропал интернет — SMS. " +
                        "Настройки: " + Config.Folder,
             });
             // Кладём таблицу на вкладку.
@@ -1493,8 +1961,8 @@ namespace SiteWatch
             }
             catch (Exception ex)
             {
-                // Переменная для out-параметра Describe; здесь не нужна.
-                bool dns;
+                // Вся ошибка, со стеком, — в журнал: по ней видно, на каком шаге оборвалось.
+                Log.Write("ERROR тестовое письмо (" + c.SmtpHost + ":" + c.SmtpPort + "): " + ex);
                 // Подсказка о самой частой причине отказа — своя для каждой почты.
                 var hint = c.SmtpHost == Config.GmailHost
                     ? "\nДля Gmail нужен пароль приложения (16 букв) с myaccount.google.com/apppasswords — " +
@@ -1502,30 +1970,91 @@ namespace SiteWatch
                     : c.SmtpHost == "smtp.yandex.ru"
                         ? "\nНужен пароль приложения Яндекса и включённый доступ почтовых программ (IMAP)."
                         : "\nПроверьте логин, пароль приложения и smtp_host / smtp_port в config.txt.";
-                // Переводим ошибку в понятный текст (тот же разбор, что и для сайтов) и добавляем подсказку.
-                MessageBox.Show(this, "Не отправилось: " + Checker.Describe(ex, out dns) + hint, "SiteWatch");
+                // Сервер, порт и вся цепочка причин — сразу видно, где оборвалось; плюс подсказка.
+                MessageBox.Show(this, "Не отправилось через " + c.SmtpHost + ":" + c.SmtpPort + ":\n" + Alerts.Explain(ex) + "\n" + hint, "SiteWatch");
             }
         }
 
-        // Кнопка «Тестовый звонок».
+        // Кнопка «Тестовое SMS» — на первый номер из списка, через выбранный COM-порт (даже без сохранения).
+        private async void TestSms()
+        {
+            var c = Collect();
+            if (c.Phones.Count == 0 || c.ComPort.Length == 0) { MessageBox.Show(this, "Укажите номер телефона и COM-порт (кнопка «Найти модем»).", "SiteWatch"); return; }
+            try
+            {
+                // В фоновом потоке — окно не замирает, пока модем ищет сеть и отправляет.
+                await Task.Run(() => Alerts.Sms(c.ComPort, c.Phones.Take(1).ToList(), "SiteWatch: тестовое SMS с компьютера " + Environment.MachineName + ". Оповещения работают."));
+                MessageBox.Show(this, "SMS отправлено на " + c.Phones[0] + ".", "SiteWatch");
+            }
+            catch (Exception ex)
+            {
+                // Порт занят, модем молчит, SIM не готова, сеть отказала — показываем причину словами модема.
+                MessageBox.Show(this, "SMS не ушло: " + ex.Message, "SiteWatch");
+            }
+        }
+
+        // Кнопка «Тестовый звонок» — на первый номер из списка.
         private async void TestCall()
         {
             // Берём то, что введено сейчас.
             var c = Collect();
             // Без номера или порта звонить некуда или нечем.
-            if (c.Phones.Count == 0 || c.ComPort.Length == 0) { MessageBox.Show(this, "Укажите номер и COM-порт.", "SiteWatch"); return; }
+            if (c.Phones.Count == 0 || c.ComPort.Length == 0) { MessageBox.Show(this, "Укажите номер телефона и COM-порт (кнопка «Найти модем»).", "SiteWatch"); return; }
             try
             {
                 // Звоним только на первый номер, в фоновом потоке — окно не замирает на полминуты.
-                await Task.Run(() => Alerts.Call(c, c.Phones.Take(1).ToList()));
+                await Task.Run(() => Alerts.Call(c.ComPort, c.Phones.Take(1).ToList()));
                 // Модем принял команды. Дошёл ли звонок — видно только по телефону.
-                MessageBox.Show(this, "Звонок выполнен.", "SiteWatch");
+                MessageBox.Show(this, "Модем позвонил на " + c.Phones[0] + " — телефон должен был звонить до 30 секунд.", "SiteWatch");
             }
             catch (Exception ex)
             {
                 // Порт занят, модем молчит, вернул ошибку — показываем причину.
                 MessageBox.Show(this, "Звонок не прошёл: " + ex.Message, "SiteWatch");
             }
+        }
+
+        // Кнопка «Найти модем»: опросить все COM-порты и выбрать тот, где ответил модем.
+        private async void FindModem()
+        {
+            var ports = PortNames();
+            if (ports.Length == 0)
+            {
+                MessageBox.Show(this, "В системе нет ни одного COM-порта: модем не подключён или для него не установлен драйвер " +
+                                      "(для модемов на SIM800C — драйвер CH340).", "SiteWatch");
+                return;
+            }
+            List<string[]> found;
+            Cursor = Cursors.WaitCursor;
+            try { found = await Task.Run(() => Alerts.Probe(ports)); }
+            finally { Cursor = Cursors.Default; }
+
+            var text = string.Join("\n", found.Select(f => f[0] + " — " + f[1]));
+            var best = found.Where(f => f[1].StartsWith("модем")).Select(f => f[0]).FirstOrDefault();
+            if (best == null)
+            {
+                MessageBox.Show(this, text + "\n\nМодем не найден: ни один порт не ответил на AT. Проверьте драйвер модема " +
+                                      "и что его порт не занят другой программой.", "SiteWatch");
+                return;
+            }
+            RefreshPorts();
+            _port.Text = best;
+            MessageBox.Show(this, text + "\n\nВыбран " + best + ". Нажмите «Сохранить», затем «Тестовое SMS».", "SiteWatch");
+        }
+
+        // COM-порты системы без повторов, по порядку номеров: COM3 раньше COM10.
+        private static string[] PortNames()
+        {
+            return SerialPort.GetPortNames().Distinct().OrderBy(p => p.Length).ThenBy(p => p).ToArray();
+        }
+
+        // Перезаполнить выпадающий список портов, не теряя то, что выбрано или вписано.
+        private void RefreshPorts()
+        {
+            var current = _port.Text;
+            _port.Items.Clear();
+            _port.Items.AddRange(PortNames());
+            _port.Text = current;
         }
 
         // Перерисовать плашку и таблицу по текущему состоянию. Вызывается в потоке интерфейса:
