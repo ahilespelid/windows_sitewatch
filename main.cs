@@ -60,7 +60,7 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("SiteWatch")]
 // Версия сборки. Раз AssemblyFileVersion не задан, она же попадает в «Версию файла».
 // Держать в согласии с Program.Version.
-[assembly: AssemblyVersion("0.4.1.0")]
+[assembly: AssemblyVersion("0.4.2.0")]
 
 // Всё приложение — в одном пространстве имён. Все классы internal: снаружи exe они никому не нужны.
 namespace SiteWatch
@@ -71,7 +71,7 @@ namespace SiteWatch
     internal static class Program
     {
         // Версия: заголовок окна, журнал, заголовок User-Agent в запросах к сайтам.
-        public const string Version = "0.4.1";
+        public const string Version = "0.4.2";
         // Ключ командной строки «запуститься свёрнутым в трей». Его дописывает автозапуск (Native.Autostart).
         public const string TrayArg = "--tray";
 
@@ -266,7 +266,6 @@ namespace SiteWatch
             "https://scanmaster.tech/",
             "https://limaster.ru/",
             "https://support.litewms.ru/",
-            "https://ahilespelid.ru/",
         };
         // Кому слать письма о падении и восстановлении.
         public List<string> MailTo = new List<string>
@@ -1203,8 +1202,9 @@ namespace SiteWatch
             Text = "SiteWatch " + Program.Version;
             // Значок окна и кнопки на панели задач.
             Icon = Icons.App;
-            // Начальный размер.
-            Size = new Size(900, 560);
+            // Начальный размер: узкое высокое окно, в котором вкладка «Настройки» видна целиком, без прокрутки.
+            // 700 по ширине — это и есть минимум; в Windows 10/11 сюда входят невидимые рамки по ~7 пикселей.
+            Size = new Size(700, 770);
             // Меньше не сжать — иначе всё налезет друг на друга.
             MinimumSize = new Size(700, 450);
             // Открывается по центру экрана.
@@ -1244,7 +1244,8 @@ namespace SiteWatch
         {
             var page = new TabPage("Состояние") { Padding = new Padding(8) };
             // Колонки таблицы в виде «название|ширина в пикселях» — компактно задать шесть колонок.
-            foreach (var c in new[] { "Сайт|170", "Состояние|130", "Ответ|230", "мс|60", "Проверен|100", "Сбои с|90" })
+            // В сумме 650 — помещаются в окно шириной 700 без горизонтальной прокрутки.
+            foreach (var c in new[] { "Сайт|150", "Состояние|110", "Ответ|180", "мс|50", "Проверен|90", "Сбои с|70" })
             {
                 // Делим на название и ширину.
                 var p = c.Split('|');
