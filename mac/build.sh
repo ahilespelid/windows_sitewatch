@@ -18,10 +18,11 @@ for ARCH in arm64 x86_64; do
 done
 lipo -create -output build/SiteWatch build/SiteWatch-arm64 build/SiteWatch-x86_64
 
-# Обёртка .app: исполняемый файл + Info.plist.
-mkdir -p "$APP/Contents/MacOS"
+# Обёртка .app: исполняемый файл, Info.plist и значок (AppIcon.icns → CFBundleIconFile).
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp build/SiteWatch "$APP/Contents/MacOS/SiteWatch"
 cp Info.plist "$APP/Contents/Info.plist"
+cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Подпись «ad-hoc», без сертификата разработчика: без неё программа не запустится на Apple Silicon.

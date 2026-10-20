@@ -2,3 +2,4 @@
 *.swift text eol=lf
 *.plist text eol=lf
 *.md text eol=lf
+*.icns binary
