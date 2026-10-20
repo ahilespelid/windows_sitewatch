@@ -22,7 +22,7 @@ build.cmd        (или: make)
   - почта-отправитель Яндекс и её пароль приложения;
   - COM-порт модема;
   - галочки «не засыпать» и «автозапуск».
-- По умолчанию уже вписаны: litewms.ru, lite-box.ru, scanmaster.tech, limaster.ru, support.litewms.ru, ahilespelid.ru. Письма идут на dvrh.76@gmail.com с goog.a@yandex.ru.
+- По умолчанию уже вписаны: litewms.ru, lite-box.ru, scanmaster.tech, limaster.ru, support.litewms.ru. Письма идут на brand.korolev@gmail.com, dvrh.76@gmail.com с admin@litewms.ru.
 - Настройки хранятся в `%AppData%\SiteWatch\config.txt`, там же журнал `sitewatch.log`. Пароль зашифрован Windows (DPAPI).
 
 ## Как решает, что сайт упал
