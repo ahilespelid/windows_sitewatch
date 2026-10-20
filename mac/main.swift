@@ -176,7 +176,7 @@ struct Config {
     ]
     var smtpHost = "smtp.gmail.com"
     var smtpPort = 587
-    var smtpUser = "brand.korolev@gmail.com"
+    var smtpUser = "fflitebox@gmail.com"
     var smtpPassword = ""
     // Телефоны для SMS и звонков и порт модема; пусто — модемом не пользуемся.
     var phones: [String] = []
