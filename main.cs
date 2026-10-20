@@ -282,7 +282,7 @@ namespace SiteWatch
         // 587 — SMTP с STARTTLS; так работают и Gmail, и Яндекс. Меняется только в файле (smtp_port).
         public int SmtpPort = 587;
         // Ящик-отправитель, он же логин SMTP: письмо уходит от его имени.
-        public string SmtpUser = "brand.korolev@gmail.com";
+        public string SmtpUser = "fflitebox@gmail.com";
         // Пароль приложения (не основной пароль ящика). В коде его нет — вводится в окне «Настройки».
         // В памяти — открытым текстом, на диске — зашифрован (см. Protect).
         public string SmtpPassword = "";

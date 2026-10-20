@@ -25,7 +25,7 @@ build.cmd        (или: make)
   - COM-порт модема — его подбирает кнопка «Найти модем»;
   - галочки «не засыпать» и «автозапуск»;
   - кнопки «Тестовое письмо», «Тестовое SMS», «Тестовый звонок», «Сбросить настройки».
-- По умолчанию вписаны litewms.ru, lite-box.ru, scanmaster.tech, limaster.ru и support.litewms.ru. Письма уходят с brand.korolev@gmail.com.
+- По умолчанию вписаны litewms.ru, lite-box.ru, scanmaster.tech, limaster.ru и support.litewms.ru. Письма уходят с fflitebox@gmail.com.
 - Настройки хранятся в `%AppData%\SiteWatch\config.txt`, там же журнал `sitewatch.log`. Пароль зашифрован средствами Windows (DPAPI).
 - Письма уходят через `curl.exe`, который есть в Windows 10 и 11: встроенный в .NET `SmtpClient` на части компьютеров обрывает соединение с Gmail («Сервер нарушил протокол»). На старых Windows без `curl.exe` письма уходят через `SmtpClient`. Порт 587 — STARTTLS, 465 — сразу TLS.
 
