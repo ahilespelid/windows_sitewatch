@@ -1,13 +1,13 @@
-// SiteWatch для macOS — паук-звонарь: следит за нашими сайтами, при падении пишет на почту.
-// Та же логика, что у Windows-версии (main.cs), но родными средствами Мака:
+// SiteWatch для macOS — паук-звонарь: следит за нашими сайтами, при падении пишет на почту,
+// а через GSM-модем шлёт SMS и звонит. Та же логика, что у Windows-версии (main.cs), но родными средствами Мака:
 //   • значок в строке меню вместо значка в трее;
 //   • пароль почты — в «Связке ключей» вместо DPAPI;
 //   • уведомления — в Центре уведомлений;
 //   • запрет сна — через IOKit (то же, что делает caffeinate);
 //   • автозапуск — LaunchAgent в ~/Library/LaunchAgents вместо реестра;
-//   • письма уходят через системный curl (SMTP + STARTTLS), своих библиотек не нужно.
+//   • письма уходят через системный curl (SMTP + STARTTLS), своих библиотек не нужно;
+//   • модем — через последовательный порт /dev/cu.* (POSIX termios), AT-команды те же, что в Windows-версии.
 // Один файл Swift (AppKit + SwiftUI), собирается build.sh без Xcode-проекта. Нужна macOS 13 Ventura или новее.
-// Звонков через GSM-модем здесь нет — эта заготовка пока только в Windows-версии.
 
 import AppKit
 import SwiftUI
@@ -19,7 +19,7 @@ import UserNotifications
 
 enum Const {
     // Версия: заголовок окна, журнал, User-Agent. Держать в согласии с Info.plist.
-    static let version = "0.4.2"
+    static let version = "0.5.0"
     // Идентификатор приложения — такой же стоит в Info.plist (CFBundleIdentifier).
     static let bundleID = "ru.litewms.sitewatch"
     // Ключ запуска «свёрнутым в строку меню» — его передаёт автозапуск.
@@ -158,8 +158,8 @@ enum Keychain {
 
 // ===================================================================== настройки
 
-// Настройки в ~/Library/Application Support/SiteWatch/config.txt — тот же формат, что у Windows-версии,
-// только без телефонов и COM-порта. Пароль — в «Связке ключей».
+// Настройки в ~/Library/Application Support/SiteWatch/config.txt — тот же формат, что у Windows-версии;
+// порт модема — путь вида /dev/cu.usbserial-1420 (ключ modem_port). Пароль — в «Связке ключей».
 struct Config {
     // Поля ниже — значения по умолчанию: первый запуск и «Сбросить настройки».
     var sites: [String] = [
@@ -178,6 +178,9 @@ struct Config {
     var smtpPort = 587
     var smtpUser = "brand.korolev@gmail.com"
     var smtpPassword = ""
+    // Телефоны для SMS и звонков и порт модема; пусто — модемом не пользуемся.
+    var phones: [String] = []
+    var modemPort = ""
     var keepAwake = true
 
     static let gmailHost = "smtp.gmail.com"
@@ -207,6 +210,7 @@ struct Config {
             var section = ""
             var sites: [String] = []
             var mail: [String] = []
+            var phones: [String] = []
             for raw in text.components(separatedBy: .newlines) {
                 let line = raw.trimmingCharacters(in: .whitespaces)
                 if line.isEmpty || line.hasPrefix("#") { continue }
@@ -219,6 +223,8 @@ struct Config {
                     sites.append(line)
                 case "mail":
                     mail.append(line)
+                case "phones":
+                    phones.append(line)
                 case "options":
                     guard let eq = line.firstIndex(of: "="), eq != line.startIndex else { continue }
                     let key = line[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
@@ -227,6 +233,7 @@ struct Config {
                     case "smtp_host": cfg.smtpHost = value
                     case "smtp_port": if let p = Int(value) { cfg.smtpPort = p }
                     case "smtp_user": cfg.smtpUser = value
+                    case "modem_port": cfg.modemPort = value
                     case "keep_awake": cfg.keepAwake = value != "0"
                     default: break
                     }
@@ -236,6 +243,7 @@ struct Config {
             }
             cfg.sites = sites
             cfg.mailTo = mail
+            cfg.phones = phones
         }
         cfg.smtpHost = hostFor(cfg.smtpUser, fallback: cfg.smtpHost)
         cfg.smtpPassword = Keychain.get(cfg.smtpUser)
@@ -245,13 +253,15 @@ struct Config {
     // Записать настройки в файл (целиком) и пароль — в «Связку ключей».
     func save() throws {
         try FileManager.default.createDirectory(at: Config.folder, withIntermediateDirectories: true)
-        var s = "# SiteWatch. Сайты и почта — по одному в строке. Пароль хранится в «Связке ключей», не здесь.\n"
+        var s = "# SiteWatch. Сайты, почта и телефоны — по одному в строке. Пароль хранится в «Связке ключей», не здесь.\n"
         s += "[sites]\n" + sites.map { $0 + "\n" }.joined()
         s += "[mail]\n" + mailTo.map { $0 + "\n" }.joined()
+        s += "[phones]\n" + phones.map { $0 + "\n" }.joined()
         s += "[options]\n"
         s += "smtp_host=\(smtpHost)\n"
         s += "smtp_port=\(smtpPort)\n"
         s += "smtp_user=\(smtpUser)\n"
+        s += "modem_port=\(modemPort)\n"
         s += "keep_awake=\(keepAwake ? "1" : "0")\n"
         try s.write(to: Config.fileURL, atomically: true, encoding: .utf8)
         try Keychain.set(smtpUser, smtpPassword)
@@ -488,6 +498,9 @@ final class Watcher {
     private var running = false
     private var again = false
     private var generation = 0
+    // Сколько кругов подряд у этого компьютера нет интернета и ушло ли об этом SMS через модем.
+    private var offlineRounds = 0
+    private var offlineSmsSent = false
 
     // Вызываются в главном потоке.
     var onChange: ((Snapshot) -> Void)?
@@ -563,7 +576,21 @@ final class Watcher {
             }
             lastRound = now
             publish()
-            roundDone()
+            // Интернета нет failThreshold кругов подряд — сайты никто не проверяет, а письмо не отправить.
+            // Модем ходит через сотовую сеть, интернет компьютера ему не нужен — одно SMS об этом.
+            offlineRounds += 1
+            if offlineRounds == Const.failThreshold {
+                let cfg = self.cfg
+                DispatchQueue.global().async {
+                    let sent = self.modem(cfg, sms: "SiteWatch (\(Machine.name)): у компьютера нет интернета, сайты не проверяются. " + Fmt.hm.string(from: Date()), call: false)
+                    self.q.async {
+                        self.offlineSmsSent = sent
+                        self.roundDone()
+                    }
+                }
+            } else {
+                roundDone()
+            }
             return
         }
         if !internetOk {
@@ -571,6 +598,10 @@ final class Watcher {
             Log.write("Интернет снова есть")
             say("Интернет снова есть", false)
         }
+        // Если о пропаже интернета уходило SMS — после круга сообщим, что проверка снова идёт.
+        offlineRounds = 0
+        let backOnline = offlineSmsSent
+        offlineSmsSent = false
 
         var down: [SiteState] = []
         var still: [SiteState] = []
@@ -616,20 +647,29 @@ final class Watcher {
         lastRound = now
         publish()
 
-        // Письма — вне очереди сторожа: отправка идёт долго. Следующий круг — после них.
+        // Оповещения — вне очереди сторожа: письма, SMS и звонки идут долго. Следующий круг — после них.
         let cfg = self.cfg
         let downList = down, stillList = still, upList = up
         DispatchQueue.global().async {
+            if backOnline {
+                self.modem(cfg, sms: "SiteWatch (\(Machine.name)): интернет снова есть, сайты проверяются. " + Fmt.hm.string(from: Date()), call: false)
+            }
             if !downList.isEmpty {
+                // Упали: письмо, SMS с причиной и звонок.
                 self.say("Не работает: " + Watcher.names(downList), true)
-                self.alert(cfg, "НЕ РАБОТАЕТ: " + Watcher.names(downList), Watcher.body("Перестали отвечать:", downList, now))
+                self.alert(cfg, "НЕ РАБОТАЕТ: " + Watcher.names(downList), Watcher.body("Перестали отвечать:", downList, now),
+                           sms: Watcher.smsText("НЕ РАБОТАЕТ", downList, now, reasons: true), call: true)
             }
             if !stillList.isEmpty {
-                self.alert(cfg, "ВСЁ ЕЩЁ НЕ РАБОТАЕТ: " + Watcher.names(stillList), Watcher.body("По-прежнему не отвечают:", stillList, now))
+                // Всё ещё лежат: письмо и звонок (причина уже была в первом SMS, лишние SMS не шлём).
+                self.alert(cfg, "ВСЁ ЕЩЁ НЕ РАБОТАЕТ: " + Watcher.names(stillList), Watcher.body("По-прежнему не отвечают:", stillList, now),
+                           sms: nil, call: true)
             }
             if !upList.isEmpty {
+                // Поднялись: письмо и SMS, без звонка.
                 self.say("Снова работает: " + Watcher.names(upList), false)
-                self.alert(cfg, "Снова работает: " + Watcher.names(upList), Watcher.body("Снова работают:", upList, now))
+                self.alert(cfg, "Снова работает: " + Watcher.names(upList), Watcher.body("Снова работают:", upList, now),
+                           sms: Watcher.smsText("Снова работает", upList, now, reasons: false), call: false)
             }
             self.q.async { self.roundDone() }
         }
@@ -649,14 +689,58 @@ final class Watcher {
         }
     }
 
-    private func alert(_ cfg: Config, _ subject: String, _ body: String) {
-        do {
-            try Mailer.send(cfg, subject: subject, body: body)
-            Log.write("Письмо: " + subject)
-        } catch {
-            Log.write("ERROR письмо не ушло: " + error.localizedDescription)
-            say("Письмо не отправлено: " + error.localizedDescription, true)
+    // Оповещение: письмо и модем (SMS, звонок) — одновременно. Если почта «висит» без связи с сервером,
+    // SMS и звонок не ждут её. sms = nil — без SMS; call — звонить ли. Сбой одного не отменяет другое.
+    private func alert(_ cfg: Config, _ subject: String, _ body: String, sms: String?, call: Bool) {
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async {
+            do {
+                try Mailer.send(cfg, subject: subject, body: body)
+                Log.write("Письмо: " + subject)
+            } catch {
+                Log.write("ERROR письмо не ушло: " + error.localizedDescription)
+                self.say("Письмо не отправлено: " + error.localizedDescription, true)
+            }
+            group.leave()
         }
+        group.enter()
+        DispatchQueue.global().async {
+            self.modem(cfg, sms: sms, call: call)
+            group.leave()
+        }
+        group.wait()
+    }
+
+    // SMS и/или звонок на все номера через модем — если указаны номера и порт. Вернёт true, если SMS ушло.
+    @discardableResult
+    private func modem(_ cfg: Config, sms: String?, call: Bool) -> Bool {
+        if cfg.phones.isEmpty || cfg.modemPort.isEmpty { return false }
+        var sent = false
+        if let text = sms {
+            do {
+                try Modem.sms(port: cfg.modemPort, phones: cfg.phones, text: text)
+                sent = true
+            } catch {
+                Log.write("ERROR SMS не ушло: " + error.localizedDescription)
+                say("SMS не отправлено: " + error.localizedDescription, true)
+            }
+        }
+        if call {
+            do {
+                try Modem.call(port: cfg.modemPort, phones: cfg.phones)
+            } catch {
+                Log.write("ERROR звонок не прошёл: " + error.localizedDescription)
+                say("Звонок не прошёл: " + error.localizedDescription, true)
+            }
+        }
+        return sent
+    }
+
+    // Короткий текст SMS: «НЕ РАБОТАЕТ: litewms.ru (502 Bad Gateway), lite-box.ru (нет ответа за 15 с). 14:05».
+    // Причины — только для упавших. Длинный текст модем отправит частями, телефон склеит их в одно сообщение.
+    static func smsText(_ title: String, _ list: [SiteState], _ now: Date, reasons: Bool) -> String {
+        title + ": " + list.map { reasons ? "\($0.name) (\($0.details))" : $0.name }.joined(separator: ", ") + ". " + Fmt.hm.string(from: now)
     }
 
     static func names(_ list: [SiteState]) -> String {
@@ -777,6 +861,336 @@ enum Mailer {
         }
         if !chunk.isEmpty { words.append(chunk) }
         return words.map { "=?UTF-8?B?" + Data($0.utf8).base64EncodedString() + "?=" }.joined(separator: "\r\n ")
+    }
+}
+
+// ===================================================================== GSM-модем
+
+// Последовательный порт модема (/dev/cu.*): 115200 бод, 8 бит, без чётности и без аппаратного управления потоком.
+// Открывается без ожидания линии (O_NONBLOCK), чтение — с ожиданием через poll(). Закрывается, когда объект освобождается.
+final class Serial {
+    private let fd: Int32
+
+    init(_ path: String) throws {
+        fd = Darwin.open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)
+        if fd < 0 { throw AppError("порт \(path) не открылся: " + String(cString: strerror(errno))) }
+        var t = termios()
+        if tcgetattr(fd, &t) != 0 { throw AppError("порт \(path): не удалось прочитать настройки") }
+        cfmakeraw(&t)
+        cfsetspeed(&t, speed_t(B115200))
+        t.c_cflag |= tcflag_t(CLOCAL | CREAD | CS8)
+        t.c_cflag &= ~tcflag_t(PARENB | CSTOPB | CCTS_OFLOW | CRTS_IFLOW)
+        if tcsetattr(fd, TCSANOW, &t) != 0 { throw AppError("порт \(path): не удалось задать скорость 115200") }
+        tcflush(fd, TCIOFLUSH)
+    }
+
+    deinit {
+        if fd >= 0 { Darwin.close(fd) }
+    }
+
+    // Выбросить всё, что модем прислал раньше (остатки ответов, RING и т. п.).
+    func discard() {
+        tcflush(fd, TCIFLUSH)
+    }
+
+    // Записать строку целиком; модем не принимает данные 3 с — ошибка.
+    func send(_ text: String) throws {
+        let bytes = Array(text.utf8)
+        var offset = 0
+        let deadline = Date().addingTimeInterval(3)
+        while offset < bytes.count {
+            let n = bytes.withUnsafeBufferPointer { Darwin.write(fd, $0.baseAddress! + offset, $0.count - offset) }
+            if n > 0 { offset += n; continue }
+            if n < 0 && errno != EAGAIN { throw AppError("порт: ошибка записи (" + String(cString: strerror(errno)) + ")") }
+            if Date() > deadline { throw AppError("порт: модем не принимает данные") }
+            usleep(20_000)
+        }
+    }
+
+    // Прочитать то, что пришло, ожидая до seconds секунд. Пустая строка — ничего не пришло.
+    func receive(wait seconds: Double) -> String {
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        if poll(&pfd, 1, Int32(max(0, seconds) * 1000)) <= 0 { return "" }
+        var buf = [UInt8](repeating: 0, count: 1024)
+        let n = Darwin.read(fd, &buf, buf.count)
+        if n <= 0 { return "" }
+        return String(decoding: buf[0..<n], as: UTF8.self)
+    }
+
+    // AT-команда; вернуть ответ модема одной строкой (без эха и OK). mustOk — без OK бросить ошибку.
+    // Ждём не дольше timeout секунд; ERROR, +CME/+CMS ERROR, NO CARRIER, BUSY — ждать дальше нечего.
+    @discardableResult
+    func at(_ cmd: String, mustOk: Bool = false, timeout: Double = 5) throws -> String {
+        discard()
+        try send(cmd + "\r")
+        var got = ""
+        var answer: [String] = []
+        var ok = false
+        var done = false
+        let deadline = Date().addingTimeInterval(timeout)
+        while !done && Date() < deadline {
+            let chunk = receive(wait: min(0.5, deadline.timeIntervalSinceNow))
+            if chunk.isEmpty { continue }
+            got += chunk
+            // Разбираем только законченные строки; хвост без перевода строки ждёт продолжения.
+            while let r = got.rangeOfCharacter(from: CharacterSet(charactersIn: "\r\n")) {
+                let line = got[..<r.lowerBound].trimmingCharacters(in: .whitespaces)
+                got.removeSubrange(got.startIndex..<r.upperBound)
+                if line.isEmpty || line == cmd { continue }
+                if line == "OK" { ok = true; done = true; break }
+                answer.append(line)
+                if line.hasPrefix("ERROR") || line.hasPrefix("+CME") || line.hasPrefix("+CMS") || line == "NO CARRIER" || line == "BUSY" {
+                    done = true
+                    break
+                }
+            }
+        }
+        let text = answer.joined(separator: " ")
+        if mustOk && !ok { throw AppError("модем не ответил OK на \(cmd) (\(text))") }
+        return text
+    }
+
+    // Ждать в ответе модема token (например, «>» или «OK») до seconds секунд. ERROR — ошибка с текстом модема.
+    func waitFor(_ token: String, seconds: Double) throws -> String {
+        var got = ""
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            got += receive(wait: min(0.5, deadline.timeIntervalSinceNow))
+            if got.contains("ERROR") { throw AppError("модем: " + Serial.clean(got)) }
+            if got.contains(token) { return got }
+        }
+        throw AppError("модем не ответил вовремя (" + Serial.clean(got) + ")")
+    }
+
+    // Ждать конца вызова до seconds секунд: сбросили, занято, не дозвонились — вернуть это слово; иначе пустую строку.
+    func waitCallEnd(seconds: Double) -> String {
+        var got = ""
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            got += receive(wait: min(0.5, deadline.timeIntervalSinceNow))
+            for word in ["NO CARRIER", "BUSY", "NO ANSWER", "NO DIALTONE"] where got.contains(word) { return word }
+        }
+        return ""
+    }
+
+    // Ответ модема одной строкой: без пустых строк и переводов строки.
+    static func clean(_ s: String) -> String {
+        s.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " ")
+    }
+}
+
+// SMS и звонки через GSM-модем (AT-команды). Модем один — тревоги и тестовые кнопки работают с ним строго по очереди.
+enum Modem {
+    private static let lock = NSLock()
+
+    // Последовательные порты Мака. Bluetooth и отладочные порты пропускаем: модема там не бывает.
+    static func listPorts() -> [String] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
+        return names.filter { $0.hasPrefix("cu.") && !$0.contains("Bluetooth") && !$0.contains("debug-console") && !$0.contains("wlan") }
+            .sorted()
+            .map { "/dev/" + $0 }
+    }
+
+    // SMS на все номера (PDU-режим, UCS-2 — кириллица; длинный текст — частями, телефон склеит).
+    // Ошибка на одном номере не мешает остальным; в конце — ошибка со списком номеров, куда не ушло.
+    static func sms(port: String, phones: [String], text: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let p = try Serial(port)
+        try prepare(p)
+        // Модем мог только что включиться и ещё ищет сеть — ждём регистрацию до 30 с.
+        if !waitNetwork(p, seconds: 30) { Log.write("Модем: нет регистрации в сети, всё равно пробую отправить SMS") }
+        try p.at("AT+CMGF=0", mustOk: true)
+        var errors: [String] = []
+        for phone in phones {
+            do {
+                let parts = try SmsPdu.encode(phone: phone, text: text, reference: UInt8.random(in: 0...255))
+                for pdu in parts { try sendPdu(p, pdu) }
+                Log.write("SMS → " + phone + (parts.count > 1 ? " (\(parts.count) части)" : ""))
+            } catch {
+                errors.append(phone + ": " + error.localizedDescription)
+                Log.write("ERROR SMS → " + phone + ": " + error.localizedDescription)
+            }
+        }
+        if !errors.isEmpty { throw AppError(errors.joined(separator: "; ")) }
+    }
+
+    // Одна часть SMS: AT+CMGS=<длина> → приглашение «>» → PDU и Ctrl+Z → «+CMGS: n» и OK.
+    private static func sendPdu(_ p: Serial, _ pdu: String) throws {
+        // Длина — в байтах и без первого байта PDU (адрес SMS-центра «00» = взять из SIM-карты).
+        let length = pdu.count / 2 - 1
+        p.discard()
+        try p.send("AT+CMGS=\(length)\r")
+        do {
+            _ = try p.waitFor(">", seconds: 10)
+        } catch {
+            // Приглашения не дождались — Esc отменяет ввод, чтобы модем не ждал текст вечно.
+            try? p.send("\u{1B}")
+            throw error
+        }
+        try p.send(pdu + "\u{1A}")
+        // Сеть может подтверждать SMS до минуты.
+        let answer = try p.waitFor("OK", seconds: 60)
+        if !answer.contains("+CMGS") { throw AppError("модем не подтвердил отправку (" + Serial.clean(answer) + ")") }
+    }
+
+    // Звонок на все номера: ATD номер; — вызов, до 30 с ожидания, ATH — сброс. Трубку брать не нужно,
+    // звонок и есть сигнал; сбросили или занято — сразу следующий номер.
+    static func call(port: String, phones: [String]) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let p = try Serial(port)
+        try prepare(p)
+        _ = waitNetwork(p, seconds: 30)
+        // OK на ATD — сразу, не дожидаясь, пока снимут трубку.
+        try p.at("AT+COLP=0")
+        var errors: [String] = []
+        for raw in phones {
+            let phone = SmsPdu.clean(raw)
+            Log.write("Звоню " + phone)
+            do {
+                // ATD<номер>; — голосовой вызов (точка с запятой = голос).
+                try p.at("ATD\(phone);", mustOk: true)
+                let end = p.waitCallEnd(seconds: 30)
+                if !end.isEmpty { Log.write("Звонок \(phone): \(end)") }
+            } catch {
+                errors.append(phone + ": " + error.localizedDescription)
+            }
+            // В любом случае кладём трубку и даём модему 2 с передышки перед следующим номером.
+            _ = try? p.at("ATH")
+            Thread.sleep(forTimeInterval: 2)
+        }
+        if !errors.isEmpty { throw AppError(errors.joined(separator: "; ")) }
+    }
+
+    // «Найти модем»: опросить порты; модем — где ответили на AT (тогда описание начинается со слова «модем»).
+    static func probe(_ ports: [String]) -> [(String, String)] {
+        ports.map { ($0, probeOne($0)) }
+    }
+
+    // Один порт: AT → модель (AT+CGMM), SIM-карта (AT+CPIN?), регистрация в сети. Без общего замка:
+    // если модем сейчас звонит, он просто не ответит. Ошибки не выпускает.
+    private static func probeOne(_ path: String) -> String {
+        do {
+            let p = try Serial(path)
+            do {
+                try p.at("AT", mustOk: true, timeout: 2)
+            } catch {
+                usleep(300_000)
+                do { try p.at("AT", mustOk: true, timeout: 2) } catch { return "не модем (нет ответа на AT)" }
+            }
+            try p.at("ATE0")
+            let model = try p.at("AT+CGMM")
+            let pin = try p.at("AT+CPIN?")
+            let sim = pin.uppercased().contains("READY") ? "SIM готова" : "SIM: " + (pin.isEmpty ? "нет ответа" : pin)
+            return "модем " + (model.isEmpty ? "(модель не назвал)" : model) + ", " + sim + ", " + (registered(p) ? "сеть есть" : "сети нет")
+        } catch {
+            return "ошибка: " + error.localizedDescription
+        }
+    }
+
+    // Подготовка: модем на связи, эхо выключено, ошибки — словами (AT+CMEE=2), SIM-карта готова.
+    private static func prepare(_ p: Serial) throws {
+        // Первый AT после открытия порта иногда теряется (модем подстраивает скорость) — даём вторую попытку.
+        do {
+            try p.at("AT", mustOk: true)
+        } catch {
+            usleep(500_000)
+            try p.at("AT", mustOk: true)
+        }
+        try p.at("ATE0")
+        try p.at("AT+CMEE=2")
+        let pin = try p.at("AT+CPIN?")
+        if !pin.uppercased().contains("READY") {
+            throw AppError("SIM-карта не готова: " + (pin.isEmpty ? "нет ответа" : pin) + " — вставлена ли SIM, не стоит ли на ней PIN-код")
+        }
+    }
+
+    // Ждать регистрации в сети до seconds секунд (опрос раз в 2 с).
+    private static func waitNetwork(_ p: Serial, seconds: Double) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while true {
+            if registered(p) { return true }
+            if Date() >= deadline { return false }
+            Thread.sleep(forTimeInterval: 2)
+        }
+    }
+
+    // Зарегистрирован ли модем: «+CREG: 0,1» — домашняя сеть, «0,5» — роуминг. 4G-модемы могут сообщать это только в +CEREG.
+    private static func registered(_ p: Serial) -> Bool {
+        regStat((try? p.at("AT+CREG?")) ?? "", "+CREG:") || regStat((try? p.at("AT+CEREG?")) ?? "", "+CEREG:")
+    }
+
+    private static func regStat(_ answer: String, _ prefix: String) -> Bool {
+        guard let r = answer.range(of: prefix) else { return false }
+        let parts = answer[r.upperBound...].split(separator: ",")
+        guard parts.count >= 2 else { return false }
+        let stat = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: " \""))
+        return stat == "1" || stat == "5"
+    }
+}
+
+// SMS в формате PDU (3GPP TS 23.040, SMS-SUBMIT) в кодировке UCS-2. Одна SMS — до 70 символов;
+// длиннее — части по 67 с заголовком склейки. Больше 4 частей (268 символов) не шлём — остальное обрезается многоточием.
+enum SmsPdu {
+    private static let maxParts = 4
+
+    // Номер без пробелов, скобок и дефисов; «+» в начале сохраняется: «+7 (989) 700-48-20» → «+79897004820».
+    static func clean(_ phone: String) -> String {
+        let s = phone.trimmingCharacters(in: .whitespaces)
+        return (s.hasPrefix("+") ? "+" : "") + s.filter { $0.isASCII && $0.isNumber }
+    }
+
+    // Готовые PDU (шестнадцатеричные строки) — по одной на каждую часть SMS.
+    static func encode(phone: String, text: String, reference: UInt8) throws -> [String] {
+        let number = clean(phone)
+        let digits = number.hasPrefix("+") ? String(number.dropFirst()) : number
+        if digits.isEmpty { throw AppError("пустой номер телефона") }
+
+        // Режем текст (в UTF-16 — как и считает UCS-2) на части, не разрывая суррогатные пары.
+        let units = Array(text.utf16)
+        var chunks: [[UInt16]] = []
+        if units.count <= 70 {
+            chunks = [units]
+        } else {
+            var pos = 0
+            while pos < units.count && chunks.count < maxParts {
+                var len = min(67, units.count - pos)
+                if len < units.count - pos && UTF16.isLeadSurrogate(units[pos + len - 1]) { len -= 1 }
+                chunks.append(Array(units[pos..<(pos + len)]))
+                pos += len
+            }
+            if pos < units.count {
+                chunks[chunks.count - 1][chunks[chunks.count - 1].count - 1] = 0x2026  // «…»
+            }
+        }
+
+        let multi = chunks.count > 1
+        return chunks.enumerated().map { (i, chunk) -> String in
+            // Данные: [заголовок склейки 05 00 03 <номер склейки> <всего частей> <эта часть>] + текст в UCS-2.
+            var ud: [UInt8] = multi ? [0x05, 0x00, 0x03, reference, UInt8(chunks.count), UInt8(i + 1)] : []
+            for u in chunk { ud.append(UInt8(u >> 8)); ud.append(UInt8(u & 0xFF)) }
+            var pdu = "00"                                         // адрес SMS-центра — из SIM-карты
+            pdu += multi ? "41" : "01"                             // SMS-SUBMIT; +0x40 — есть заголовок склейки
+            pdu += "00"                                            // номер сообщения назначит модем
+            pdu += String(format: "%02lX", digits.count)           // длина номера в цифрах
+            pdu += number.hasPrefix("+") ? "91" : "81"             // 91 — международный (+7…), 81 — как набран (8…)
+            pdu += swap(digits)                                    // цифры парами наоборот, нечётная — с F
+            pdu += "00"                                            // протокол — обычная SMS
+            pdu += "08"                                            // кодировка UCS-2
+            pdu += String(format: "%02lX", ud.count)               // длина данных в байтах
+            pdu += ud.map { String(format: "%02X", $0) }.joined()
+            return pdu
+        }
+    }
+
+    // «79897004820» → «9798074028F0»: в PDU цифры номера идут парами, переставленными местами.
+    private static func swap(_ digits: String) -> String {
+        var d = Array(digits)
+        if d.count % 2 == 1 { d.append("F") }
+        var out = ""
+        for i in stride(from: 0, to: d.count, by: 2) { out.append(d[i + 1]); out.append(d[i]) }
+        return out
     }
 }
 
@@ -922,9 +1336,13 @@ final class AppModel: ObservableObject {
     @Published var mailText = ""
     @Published var user = ""
     @Published var password = ""
+    @Published var phonesText = ""
+    @Published var modemPort = ""
+    @Published var ports: [String] = []
     @Published var keepAwake = true
     @Published var autostart = false
-    @Published var sending = false
+    // Идёт долгая операция (письмо, SMS, звонок, поиск модема) — кнопки этих операций неактивны.
+    @Published var busy = false
 
     private(set) var cfg: Config
     unowned let app: AppDelegate
@@ -946,6 +1364,9 @@ final class AppModel: ObservableObject {
         mailText = cfg.mailTo.joined(separator: "\n")
         user = cfg.smtpUser
         password = cfg.smtpPassword
+        phonesText = cfg.phones.joined(separator: "\n")
+        modemPort = cfg.modemPort
+        ports = Modem.listPorts()
         keepAwake = cfg.keepAwake
         autostart = Autostart.isOn()
     }
@@ -968,6 +1389,8 @@ final class AppModel: ObservableObject {
         c.smtpPort = cfg.smtpPort
         // Google показывает пароль приложения группами через пробел — в самом пароле пробелов нет.
         c.smtpPassword = c.smtpHost == Config.gmailHost ? String(password.filter { !$0.isWhitespace }) : password
+        c.phones = AppModel.lines(phonesText)
+        c.modemPort = modemPort.trimmingCharacters(in: .whitespaces)
         c.keepAwake = keepAwake
         return c
     }
@@ -991,7 +1414,7 @@ final class AppModel: ObservableObject {
 
     func testMail() {
         let c = collect()
-        sending = true
+        busy = true
         DispatchQueue.global().async {
             let failure: String?
             do {
@@ -1002,7 +1425,7 @@ final class AppModel: ObservableObject {
                 failure = error.localizedDescription
             }
             DispatchQueue.main.async {
-                self.sending = false
+                self.busy = false
                 if let f = failure {
                     showInfo("Не отправилось: " + f + Mailer.hint(c.smtpHost))
                 } else {
@@ -1012,9 +1435,67 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // «Тестовое SMS» и «Тестовый звонок» — на первый номер из списка, через выбранный порт (даже без сохранения).
+    func testSms() {
+        let c = collect()
+        guard let first = c.phones.first, !c.modemPort.isEmpty else {
+            showInfo("Укажите номер телефона и порт модема (кнопка «Найти модем»).")
+            return
+        }
+        runModem({ try Modem.sms(port: c.modemPort, phones: [first], text: "SiteWatch: тестовое SMS с компьютера \(Machine.name) (macOS). Оповещения работают.") },
+                 ok: "SMS отправлено на \(first).", fail: "SMS не ушло: ")
+    }
+
+    func testCall() {
+        let c = collect()
+        guard let first = c.phones.first, !c.modemPort.isEmpty else {
+            showInfo("Укажите номер телефона и порт модема (кнопка «Найти модем»).")
+            return
+        }
+        runModem({ try Modem.call(port: c.modemPort, phones: [first]) },
+                 ok: "Модем позвонил на \(first) — телефон должен был звонить до 30 секунд.", fail: "Звонок не прошёл: ")
+    }
+
+    // Выполнить работу с модемом в фоне и показать итог.
+    private func runModem(_ work: @escaping () throws -> Void, ok: String, fail: String) {
+        busy = true
+        DispatchQueue.global().async {
+            var failure: String?
+            do { try work() } catch { failure = error.localizedDescription }
+            DispatchQueue.main.async {
+                self.busy = false
+                showInfo(failure.map { fail + $0 } ?? ok)
+            }
+        }
+    }
+
+    // «Найти модем»: опросить последовательные порты и выбрать тот, где ответил модем.
+    func findModem() {
+        let list = Modem.listPorts()
+        ports = list
+        if list.isEmpty {
+            showInfo("Последовательных портов нет: модем не подключён или для него не установлен драйвер (для SIM800C — драйвер CH340).")
+            return
+        }
+        busy = true
+        DispatchQueue.global().async {
+            let found = Modem.probe(list)
+            DispatchQueue.main.async {
+                self.busy = false
+                let text = found.map { "\($0.0) — \($0.1)" }.joined(separator: "\n")
+                if let best = found.first(where: { $0.1.hasPrefix("модем") })?.0 {
+                    self.modemPort = best
+                    showInfo(text + "\n\nВыбран \(best). Нажмите «Сохранить», затем «Тестовое SMS».")
+                } else {
+                    showInfo(text + "\n\nМодем не найден: ни один порт не ответил на AT. Проверьте драйвер модема и что его порт не занят другой программой.")
+                }
+            }
+        }
+    }
+
     func reset() {
         guard askYesNo("Сбросить все настройки к значениям по умолчанию?",
-                       "Список сайтов и адреса вернутся к исходным, пароль почты будет удалён из «Связки ключей» — его нужно будет ввести заново, иначе письма уходить не будут.") else { return }
+                       "Список сайтов, адреса, телефоны и порт модема вернутся к исходным, пароль почты будет удалён из «Связки ключей» — его нужно будет ввести заново, иначе письма уходить не будут.") else { return }
         let d = Config()
         do {
             Keychain.deleteAll()
@@ -1178,6 +1659,27 @@ struct SettingsView: View {
                     SecureField("", text: $model.password)
                         .frame(width: 260)
                 }
+                row("Телефоны: SMS и звонок (+79…)") { editor($model.phonesText, height: 60) }
+                row("Порт модема") {
+                    HStack {
+                        TextField("/dev/cu.…", text: $model.modemPort)
+                            .autocorrectionDisabled()
+                            .frame(width: 210)
+                        // Выбор из найденных последовательных портов; список можно обновить.
+                        Menu("Порты") {
+                            if model.ports.isEmpty { Text("Портов нет") }
+                            ForEach(model.ports, id: \.self) { port in
+                                Button(port) { model.modemPort = port }
+                            }
+                            Divider()
+                            Button("Обновить список") { model.ports = Modem.listPorts() }
+                        }
+                        .fixedSize()
+                        // Опросит порты и выберет тот, где ответил модем.
+                        Button("Найти модем") { model.findModem() }
+                            .disabled(model.busy)
+                    }
+                }
                 row("") {
                     Toggle("Не давать компьютеру засыпать", isOn: $model.keepAwake)
                         .toggleStyle(.checkbox)
@@ -1190,7 +1692,11 @@ struct SettingsView: View {
                     HStack {
                         Button("Сохранить") { model.save() }
                         Button("Тестовое письмо") { model.testMail() }
-                            .disabled(model.sending)
+                            .disabled(model.busy)
+                        Button("Тестовое SMS") { model.testSms() }
+                            .disabled(model.busy)
+                        Button("Тестовый звонок") { model.testCall() }
+                            .disabled(model.busy)
                     }
                 }
                 row("") {
@@ -1200,7 +1706,7 @@ struct SettingsView: View {
                     }
                 }
                 row("") {
-                    Text("Проверка раз в \(Int(Const.intervalSeconds)) с; упал = \(Const.failThreshold) неудачи подряд; пока лежит — напоминание раз в \(Int(Const.reminderMinutes)) мин. Пароль хранится в «Связке ключей». Настройки: \(Config.folder.path)")
+                    Text("Проверка раз в \(Int(Const.intervalSeconds)) с; упал = \(Const.failThreshold) неудачи подряд; пока лежит — напоминание раз в \(Int(Const.reminderMinutes)) мин. Модем (если указаны порт и номера): сайт упал — SMS с причиной и звонок, напоминания — звонком, сайт поднялся — SMS; у компьютера пропал интернет — SMS. Пароль хранится в «Связке ключей». Настройки: \(Config.folder.path)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1221,11 +1727,11 @@ struct SettingsView: View {
         }
     }
 
-    private func editor(_ text: Binding<String>) -> some View {
+    private func editor(_ text: Binding<String>, height: CGFloat = 90) -> some View {
         TextEditor(text: text)
             .font(.body)
             .autocorrectionDisabled()
-            .frame(width: 360, height: 90)
+            .frame(width: 360, height: height)
             .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.4)))
     }
 }
@@ -1333,7 +1839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         window.title = "SiteWatch \(Const.version)"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.isReleasedWhenClosed = false
-        window.setContentSize(NSSize(width: 700, height: 700))
+        window.setContentSize(NSSize(width: 700, height: 760))
         window.minSize = NSSize(width: 660, height: 450)
         window.center()
     }
