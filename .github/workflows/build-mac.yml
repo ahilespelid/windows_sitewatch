@@ -1,0 +1,20 @@
+name: build-mac
+
+on:
+  push:
+    branches: [mac]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build SiteWatch.app (swiftc, без Xcode-проекта)
+        run: bash mac/build.sh
+      - name: Zip (ditto сохраняет права и подпись .app)
+        run: ditto -c -k --keepParent mac/SiteWatch.app SiteWatch-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SiteWatch-mac
+          path: SiteWatch-mac.zip
